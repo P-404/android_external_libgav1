@@ -3,15 +3,17 @@
 
 #include "src/dsp/cpu.h"
 #include "src/dsp/dsp.h"
-#include "src/dsp/intrapred.h"
 
 namespace libgav1 {
 namespace dsp {
 
-// Initializes Dsp::intra_predictors with sse4 implementations. This function
-// is not thread-safe.
+// Initializes Dsp::intra_predictors, Dsp::directional_intra_predictor_zone*,
+// Dsp::cfl_intra_predictors, Dsp::cfl_subsamplers and
+// Dsp::filter_intra_predictor, see the defines below for specifics. These
+// functions are not thread-safe.
 void IntraPredInit_SSE4_1();
 void IntraPredCflInit_SSE4_1();
+void IntraPredSmoothInit_SSE4_1();
 
 }  // namespace dsp
 }  // namespace libgav1
@@ -118,6 +120,62 @@ void IntraPredCflInit_SSE4_1();
 #ifndef LIBGAV1_Dsp8bpp_TransformSize64x64_IntraPredictorDcTop
 #define LIBGAV1_Dsp8bpp_TransformSize64x64_IntraPredictorDcTop \
   LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize4x4_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize4x4_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize4x8_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize4x8_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize4x16_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize4x16_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize8x4_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize8x4_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize8x8_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize8x8_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize8x16_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize8x16_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize8x32_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize8x32_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize16x4_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize16x4_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize16x8_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize16x8_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize16x16_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize16x16_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize16x32_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize16x32_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize32x8_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize32x8_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize32x16_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize32x16_CflSubsampler420 LIBGAV1_DSP_SSE4_1
+#endif
+
+#ifndef LIBGAV1_Dsp8bpp_TransformSize32x32_CflSubsampler420
+#define LIBGAV1_Dsp8bpp_TransformSize32x32_CflSubsampler420 LIBGAV1_DSP_SSE4_1
 #endif
 
 #ifndef LIBGAV1_Dsp8bpp_TransformSize4x4_CflSubsampler444

@@ -3,13 +3,12 @@
 
 #include "src/dsp/cpu.h"
 #include "src/dsp/dsp.h"
-#include "src/dsp/loop_filter.h"
 
 namespace libgav1 {
 namespace dsp {
 
-// Initializes Dsp::loop_restorations with neon implementations. This function
-// is not thread-safe.
+// Initializes Dsp::loop_restorations, see the defines below for specifics.
+// This function is not thread-safe.
 void LoopRestorationInit_NEON();
 
 }  // namespace dsp
@@ -17,8 +16,8 @@ void LoopRestorationInit_NEON();
 
 #if LIBGAV1_ENABLE_NEON
 
-#define LIBGAV1_Dsp8bpp_SelfGuidedFilter LIBGAV1_DSP_NEON
 #define LIBGAV1_Dsp8bpp_WienerFilter LIBGAV1_DSP_NEON
+#define LIBGAV1_Dsp8bpp_SelfGuidedFilter LIBGAV1_DSP_NEON
 
 #endif  // LIBGAV1_ENABLE_NEON
 

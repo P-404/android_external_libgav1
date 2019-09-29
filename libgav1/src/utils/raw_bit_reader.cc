@@ -16,18 +16,16 @@
 namespace libgav1 {
 namespace {
 
-const int kMaximumLeb128Size = 8;
-const uint8_t kLeb128ValueByteMask = 0x7f;
-const uint8_t kLeb128TerminationByteMask = 0x80;
+constexpr int kMaximumLeb128Size = 8;
+constexpr uint8_t kLeb128ValueByteMask = 0x7f;
+constexpr uint8_t kLeb128TerminationByteMask = 0x80;
 
-inline uint8_t Mod8(size_t n) {
+uint8_t Mod8(size_t n) {
   // Last 3 bits are the value of mod 8.
   return n & 0x07;
 }
 
-inline size_t DivideBy8(size_t n, bool ceil) {
-  return (n + (ceil ? 7 : 0)) >> 3;
-}
+size_t DivideBy8(size_t n, bool ceil) { return (n + (ceil ? 7 : 0)) >> 3; }
 
 }  // namespace
 
@@ -36,8 +34,7 @@ RawBitReader::RawBitReader(const uint8_t* data, size_t size)
   assert(data_ != nullptr || size_ == 0);
 }
 
-int RawBitReader::ReadBit() {
-  if (Finished()) return -1;
+int RawBitReader::ReadBitImpl() {
   const size_t byte_offset = DivideBy8(bit_offset_, false);
   const uint8_t byte = data_[byte_offset];
   const uint8_t shift = 7 - Mod8(bit_offset_);
@@ -45,11 +42,19 @@ int RawBitReader::ReadBit() {
   return static_cast<int>((byte >> shift) & 0x01);
 }
 
+int RawBitReader::ReadBit() {
+  if (Finished()) return -1;
+  return ReadBitImpl();
+}
+
 int64_t RawBitReader::ReadLiteral(int num_bits) {
+  assert(num_bits <= 32);
   if (!CanReadLiteral(num_bits)) return -1;
   uint32_t value = 0;
+  // We can now call ReadBitImpl() since we've made sure that there are enough
+  // bits to be read.
   for (int i = num_bits - 1; i >= 0; --i) {
-    value |= static_cast<uint32_t>(ReadBit()) << i;
+    value |= static_cast<uint32_t>(ReadBitImpl()) << i;
   }
   return value;
 }
@@ -179,7 +184,6 @@ bool RawBitReader::SkipBits(size_t num_bits) {
 
 bool RawBitReader::CanReadLiteral(size_t num_bits) const {
   if (Finished()) return false;
-  if (DivideBy8(num_bits, true) > sizeof(int)) return false;
   const size_t bit_offset = bit_offset_ + num_bits - 1;
   return DivideBy8(bit_offset, false) < size_;
 }

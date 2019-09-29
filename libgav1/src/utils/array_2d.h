@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <type_traits>
 
 #include "src/utils/compiler_attributes.h"
 
@@ -61,10 +62,15 @@ class Array2D {
   LIBGAV1_MUST_USE_RESULT bool Reset(int rows, int columns,
                                      bool zero_initialize = true) {
     const size_t size = rows * columns;
-    if (size_ < size) {
+    // If T is not a trivial type, we should always reallocate the data_
+    // buffer, so that the destructors of any existing objects are invoked.
+    if (!std::is_trivial<T>::value || size_ < size) {
       // Note: This invokes the global operator new if T is a non-class type,
-      // such as integer or enum types, or a class that we don't own, such as
-      // std::unique_ptr.
+      // such as integer or enum types, or a class type that is not derived
+      // from libgav1::Allocable, such as std::unique_ptr. If we enforce a
+      // maximum allocation size or keep track of our own heap memory
+      // consumption, we will need to handle the allocations here that use the
+      // global operator new.
       if (zero_initialize) {
         data_.reset(new (std::nothrow) T[size]());
       } else {
@@ -76,7 +82,10 @@ class Array2D {
       }
       size_ = size;
     } else if (zero_initialize) {
-      memset(data_.get(), 0, sizeof(T) * size);
+      // Cast the data_ pointer to void* to avoid the GCC -Wclass-memaccess
+      // warning. The memset is safe because T is a trivial type.
+      void* dest = data_.get();
+      memset(dest, 0, sizeof(T) * size);
     }
     data_view_.Reset(rows, columns, data_.get());
     return true;
