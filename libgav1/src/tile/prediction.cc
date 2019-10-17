@@ -15,6 +15,7 @@
 #include "src/prediction_mask.h"
 #include "src/tile.h"
 #include "src/utils/array_2d.h"
+#include "src/utils/bit_mask_set.h"
 #include "src/utils/block_parameters_holder.h"
 #include "src/utils/common.h"
 #include "src/utils/constants.h"
@@ -27,7 +28,8 @@
 namespace libgav1 {
 namespace {
 
-const int kAngleStep = 3;
+constexpr int kObmcBufferSize = 4096;  // 64x64
+constexpr int kAngleStep = 3;
 constexpr int kPredictionModeToAngle[kIntraPredictionModesUV] = {
     0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0};
 
@@ -39,32 +41,21 @@ enum : uint8_t {
 // The values for directional and dc modes are not used since the left/top
 // requirement for those modes depend on the prediction angle and the type of dc
 // mode.
-constexpr uint8_t kPredictionModeNeeds[kIntraPredictionModesY] = {
-    0,                       // kPredictionModeDc
-    kNeedsTop,               // kPredictionModeVertical
-    kNeedsLeft,              // kPredictionModeHorizontal
-    kNeedsTop,               // kPredictionModeD45
-    kNeedsLeft | kNeedsTop,  // kPredictionModeD135
-    kNeedsLeft | kNeedsTop,  // kPredictionModeD113
-    kNeedsLeft | kNeedsTop,  // kPredictionModeD157
-    kNeedsLeft,              // kPredictionModeD203
-    kNeedsTop,               // kPredictionModeD67
-    kNeedsLeft | kNeedsTop,  // kPredictionModeSmooth
-    kNeedsLeft | kNeedsTop,  // kPredictionModeSmoothVertical
-    kNeedsLeft | kNeedsTop,  // kPredictionModeSmoothHorizontal
-    kNeedsLeft | kNeedsTop   // kPredictionModePaeth
+constexpr BitMaskSet kPredictionModeNeedsMask[kIntraPredictionModesY] = {
+    BitMaskSet(0),                      // kPredictionModeDc
+    BitMaskSet(kNeedsTop),              // kPredictionModeVertical
+    BitMaskSet(kNeedsLeft),             // kPredictionModeHorizontal
+    BitMaskSet(kNeedsTop),              // kPredictionModeD45
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeD135
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeD113
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeD157
+    BitMaskSet(kNeedsLeft),             // kPredictionModeD203
+    BitMaskSet(kNeedsTop),              // kPredictionModeD67
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeSmooth
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeSmoothVertical
+    BitMaskSet(kNeedsLeft, kNeedsTop),  // kPredictionModeSmoothHorizontal
+    BitMaskSet(kNeedsLeft, kNeedsTop)   // kPredictionModePaeth
 };
-
-const int kBlendFromAbove = 0;
-const int kBlendFromLeft = 1;
-constexpr uint8_t kObmcMask2[2] = {45, 64};
-constexpr uint8_t kObmcMask4[4] = {39, 50, 59, 64};
-constexpr uint8_t kObmcMask8[8] = {36, 42, 48, 53, 57, 61, 64, 64};
-constexpr uint8_t kObmcMask16[16] = {34, 37, 40, 43, 46, 49, 52, 54,
-                                     56, 58, 60, 61, 64, 64, 64, 64};
-constexpr uint8_t kObmcMask32[32] = {33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48,
-                                     50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 60,
-                                     61, 62, 64, 64, 64, 64, 64, 64, 64, 64};
 
 int16_t GetDirectionalIntraPredictorDerivative(const int angle) {
   assert(angle >= 3);
@@ -72,45 +63,20 @@ int16_t GetDirectionalIntraPredictorDerivative(const int angle) {
   return kDirectionalIntraPredictorDerivative[DivideBy2(angle) - 1];
 }
 
+// Maps the block_size to an index as follows:
+//  kBlock8x8 => 0.
+//  kBlock8x16 => 1.
+//  kBlock8x32 => 2.
+//  kBlock16x8 => 3.
+//  kBlock16x16 => 4.
+//  kBlock16x32 => 5.
+//  kBlock32x8 => 6.
+//  kBlock32x16 => 7.
+//  kBlock32x32 => 8.
 int GetWedgeBlockSizeIndex(BlockSize block_size) {
   assert(block_size >= kBlock8x8);
-  switch (block_size) {
-    case kBlock8x8:
-      return 0;
-    case kBlock8x16:
-      return 1;
-    case kBlock8x32:
-      return 2;
-    case kBlock16x8:
-      return 3;
-    case kBlock16x16:
-      return 4;
-    case kBlock16x32:
-      return 5;
-    case kBlock32x8:
-      return 6;
-    case kBlock32x16:
-      return 7;
-    case kBlock32x32:
-      return 8;
-    default:
-      return -1;
-  }
-}
-
-const uint8_t* GetObmcMask(int length) {
-  switch (length) {
-    case 2:
-      return kObmcMask2;
-    case 4:
-      return kObmcMask4;
-    case 8:
-      return kObmcMask8;
-    case 16:
-      return kObmcMask16;
-    default:
-      return kObmcMask32;
-  }
+  return block_size - kBlock8x8 - static_cast<int>(block_size >= kBlock16x8) -
+         static_cast<int>(block_size >= kBlock32x8);
 }
 
 // 7.11.2.9.
@@ -235,17 +201,15 @@ dsp::IntraPredictor GetIntraPredictor(PredictionMode mode, bool has_left,
   }
 }
 
-// 7.11.3.2.
-void SetInterRoundingBits(const bool is_compound, const int bitdepth,
-                          uint8_t round_bits[2],
-                          uint8_t* const post_round_bits) {
-  round_bits[0] = 3;
-  round_bits[1] = is_compound ? 7 : 11;
-  if (bitdepth == 12) {
-    round_bits[0] += 2;
-    if (!is_compound) round_bits[1] -= 2;
-  }
-  *post_round_bits = 2 * kFilterBits - round_bits[0] - round_bits[1];
+// 7.11.3.2. Note InterRoundBits0 is derived in the dsp layer.
+int GetInterRoundingBits(const bool is_compound, const int bitdepth) {
+  if (is_compound) return 7;
+#if LIBGAV1_MAX_BITDEPTH == 12
+  if (bitdepth == 12) return 9;
+#else
+  static_cast<void>(bitdepth);
+#endif
+  return 11;
 }
 
 uint8_t* GetStartPoint(Array2DView<uint8_t>* const buffer, const int plane,
@@ -262,30 +226,35 @@ uint8_t* GetStartPoint(Array2DView<uint8_t>* const buffer, const int plane,
   return &buffer[plane][y][x];
 }
 
-inline int GetPixelPositionFromHighScale(int start, int step, int offset) {
+int GetPixelPositionFromHighScale(int start, int step, int offset) {
   return (start + step * offset) >> kScaleSubPixelBits;
 }
 
-}  // namespace
-
-bool Tile::BlockDecoded(const Block& block, Plane plane, int row4x4,
-                        int column4x4, bool has_top_or_left) const {
-  if (!has_top_or_left) return false;
-  if (row4x4 >= 0 && column4x4 >= 0) {
-    return block.sb_buffer->block_decoded[plane][row4x4][column4x4];
-  }
-  if (row4x4 < 0) {
-    return column4x4 < (block.sb_buffer->block_decoded_width_threshold >>
-                        SubsamplingX(plane));
-  }
-  assert(column4x4 < 0);
-  const int sb_size4x4 =
-      kNum4x4BlocksWide[sequence_header_.use_128x128_superblock ? kBlock128x128
-                                                                : kBlock64x64];
-  return row4x4 < (block.sb_buffer->block_decoded_height_threshold >>
-                   SubsamplingY(plane)) &&
-         row4x4 != (sb_size4x4 >> SubsamplingY(plane));
+dsp::MaskBlendFunc GetMaskBlendFunc(const dsp::Dsp& dsp,
+                                    InterIntraMode inter_intra_mode,
+                                    bool is_wedge_inter_intra,
+                                    int subsampling_x, int subsampling_y) {
+  const int is_inter_intra =
+      static_cast<int>(inter_intra_mode != kNumInterIntraModes);
+  return (is_inter_intra == 1 && !is_wedge_inter_intra)
+             ? dsp.mask_blend[0][is_inter_intra]
+             : dsp.mask_blend[subsampling_x + subsampling_y][is_inter_intra];
 }
+
+void PopulatePredictionMaskFromWedgeMask(const uint8_t* wedge_mask,
+                                         int wedge_mask_stride,
+                                         int prediction_width,
+                                         int prediction_height,
+                                         uint8_t* prediction_mask,
+                                         int prediction_mask_stride) {
+  for (int y = 0; y < prediction_height; ++y) {
+    memcpy(prediction_mask, wedge_mask, prediction_width);
+    prediction_mask += prediction_mask_stride;
+    wedge_mask += wedge_mask_stride;
+  }
+}
+
+}  // namespace
 
 template <typename Pixel>
 void Tile::IntraPrediction(const Block& block, Plane plane, int x, int y,
@@ -294,14 +263,12 @@ void Tile::IntraPrediction(const Block& block, Plane plane, int x, int y,
                            TransformSize tx_size) {
   const int width = 1 << kTransformWidthLog2[tx_size];
   const int height = 1 << kTransformHeightLog2[tx_size];
-  const int x_shift =
-      (plane == kPlaneY) ? 0 : sequence_header_.color_config.subsampling_x;
-  const int y_shift =
-      (plane == kPlaneY) ? 0 : sequence_header_.color_config.subsampling_y;
+  const int x_shift = subsampling_x_[plane];
+  const int y_shift = subsampling_y_[plane];
   const int max_x = (MultiplyBy4(frame_header_.columns4x4) >> x_shift) - 1;
   const int max_y = (MultiplyBy4(frame_header_.rows4x4) >> y_shift) - 1;
-  alignas(16) Pixel top_row_data[160] = {};
-  alignas(16) Pixel left_column_data[160] = {};
+  alignas(kMaxAlignment) Pixel top_row_data[160] = {};
+  alignas(kMaxAlignment) Pixel left_column_data[160] = {};
   // Some predictors use |top_row_data| and |left_column_data| with a negative
   // offset to access pixels to the top-left of the current block. So have some
   // space before the arrays to allow populating those without having to move
@@ -322,7 +289,7 @@ void Tile::IntraPrediction(const Block& block, Plane plane, int x, int y,
                     kAngleStep
           : 0;
   const bool needs_top = use_filter_intra ||
-                         ((kPredictionModeNeeds[mode] & kNeedsTop) != 0) ||
+                         kPredictionModeNeedsMask[mode].Contains(kNeedsTop) ||
                          (is_directional_mode && prediction_angle < 180) ||
                          (mode == kPredictionModeDc && has_top);
   Array2DView<Pixel> buffer(buffer_[plane].rows(),
@@ -346,7 +313,7 @@ void Tile::IntraPrediction(const Block& block, Plane plane, int x, int y,
     }
   }
   const bool needs_left = use_filter_intra ||
-                          ((kPredictionModeNeeds[mode] & kNeedsLeft) != 0) ||
+                          kPredictionModeNeedsMask[mode].Contains(kNeedsLeft) ||
                           (is_directional_mode && prediction_angle > 90) ||
                           (mode == kPredictionModeDc && has_left);
   if (needs_left) {
@@ -404,7 +371,11 @@ template void Tile::IntraPrediction<uint16_t>(const Block& block, Plane plane,
                                               TransformSize tx_size);
 #endif
 
-bool Tile::UsesSmoothPrediction(int row, int column, Plane plane) const {
+constexpr BitMaskSet kPredictionModeSmoothMask(kPredictionModeSmooth,
+                                               kPredictionModeSmoothHorizontal,
+                                               kPredictionModeSmoothVertical);
+
+bool Tile::IsSmoothPrediction(int row, int column, Plane plane) const {
   const BlockParameters& bp = *block_parameters_holder_.Find(row, column);
   PredictionMode mode;
   if (plane == kPlaneY) {
@@ -413,14 +384,12 @@ bool Tile::UsesSmoothPrediction(int row, int column, Plane plane) const {
     if (bp.reference_frame[0] > kReferenceFrameIntra) return false;
     mode = bp.uv_mode;
   }
-  return mode == kPredictionModeSmooth ||
-         mode == kPredictionModeSmoothHorizontal ||
-         mode == kPredictionModeSmoothVertical;
+  return kPredictionModeSmoothMask.Contains(mode);
 }
 
 int Tile::GetIntraEdgeFilterType(const Block& block, Plane plane) const {
-  const int subsampling_x = SubsamplingX(plane);
-  const int subsampling_y = SubsamplingY(plane);
+  const int subsampling_x = subsampling_x_[plane];
+  const int subsampling_y = subsampling_y_[plane];
   if ((plane == kPlaneY && block.top_available) ||
       (plane != kPlaneY && block.TopAvailableChroma())) {
     const int row =
@@ -429,7 +398,7 @@ int Tile::GetIntraEdgeFilterType(const Block& block, Plane plane) const {
     const int column =
         block.column4x4 +
         static_cast<int>(subsampling_x != 0 && (block.column4x4 & 1) == 0);
-    if (UsesSmoothPrediction(row, column, plane)) return 1;
+    if (IsSmoothPrediction(row, column, plane)) return 1;
   }
   if ((plane == kPlaneY && block.left_available) ||
       (plane != kPlaneY && block.LeftAvailableChroma())) {
@@ -438,7 +407,7 @@ int Tile::GetIntraEdgeFilterType(const Block& block, Plane plane) const {
     const int column =
         block.column4x4 - 1 -
         static_cast<int>(subsampling_x != 0 && (block.column4x4 & 1) != 0);
-    if (UsesSmoothPrediction(row, column, plane)) return 1;
+    if (IsSmoothPrediction(row, column, plane)) return 1;
   }
   return 0;
 }
@@ -544,6 +513,8 @@ void Tile::PalettePrediction(const Block& block, const Plane plane,
                             buffer_[plane].columns() / sizeof(Pixel),
                             reinterpret_cast<Pixel*>(&buffer_[plane][0][0]));
   for (int row = 0; row < tx_height; ++row) {
+    assert(block.bp->prediction_parameters
+               ->color_index_map[plane_type][y4 + row] != nullptr);
     for (int column = 0; column < tx_width; ++column) {
       buffer[start_y + row][start_x + column] =
           palette[block.bp->prediction_parameters
@@ -565,30 +536,30 @@ template <typename Pixel>
 void Tile::ChromaFromLumaPrediction(const Block& block, const Plane plane,
                                     const int start_x, const int start_y,
                                     const TransformSize tx_size) {
-  const int subsampling_x = SubsamplingX(plane);
-  const int subsampling_y = SubsamplingY(plane);
+  const int subsampling_x = subsampling_x_[plane];
+  const int subsampling_y = subsampling_y_[plane];
   const PredictionParameters& prediction_parameters =
       *block.bp->prediction_parameters;
-  const int luma_y = start_y << subsampling_y;
-  const int luma_x = start_x << subsampling_x;
   Array2DView<Pixel> y_buffer(
       buffer_[kPlaneY].rows(), buffer_[kPlaneY].columns() / sizeof(Pixel),
       reinterpret_cast<Pixel*>(&buffer_[kPlaneY][0][0]));
-  if (!block.sb_buffer->cfl_luma_buffer_valid) {
+  if (!block.scratch_buffer->cfl_luma_buffer_valid) {
+    const int luma_x = start_x << subsampling_x;
+    const int luma_y = start_y << subsampling_y;
     dsp_.cfl_subsamplers[tx_size][subsampling_x + subsampling_y](
-        block.sb_buffer->cfl_luma_buffer,
-        prediction_parameters.max_luma_width - (start_x << subsampling_x),
-        prediction_parameters.max_luma_height - (start_y << subsampling_y),
+        block.scratch_buffer->cfl_luma_buffer,
+        prediction_parameters.max_luma_width - luma_x,
+        prediction_parameters.max_luma_height - luma_y,
         reinterpret_cast<uint8_t*>(&y_buffer[luma_y][luma_x]),
         buffer_[kPlaneY].columns());
-    block.sb_buffer->cfl_luma_buffer_valid = true;
+    block.scratch_buffer->cfl_luma_buffer_valid = true;
   }
   Array2DView<Pixel> buffer(buffer_[plane].rows(),
                             buffer_[plane].columns() / sizeof(Pixel),
                             reinterpret_cast<Pixel*>(&buffer_[plane][0][0]));
   dsp_.cfl_intra_predictors[tx_size](
       reinterpret_cast<uint8_t*>(&buffer[start_y][start_x]),
-      buffer_[plane].columns(), block.sb_buffer->cfl_luma_buffer,
+      buffer_[plane].columns(), block.scratch_buffer->cfl_luma_buffer,
       (plane == kPlaneU) ? prediction_parameters.cfl_alpha_u
                          : prediction_parameters.cfl_alpha_v);
 }
@@ -608,16 +579,15 @@ void Tile::InterIntraPrediction(
     const ptrdiff_t prediction_mask_stride,
     const PredictionParameters& prediction_parameters,
     const int prediction_width, const int prediction_height,
-    const int subsampling_x, const int subsampling_y,
-    const uint8_t post_round_bits, uint8_t* const dest,
+    const int subsampling_x, const int subsampling_y, uint8_t* const dest,
     const ptrdiff_t dest_stride) {
+  assert(prediction_mask != nullptr);
   assert(prediction_parameters.compound_prediction_type ==
              kCompoundPredictionTypeIntra ||
          prediction_parameters.compound_prediction_type ==
              kCompoundPredictionTypeWedge);
   // The first buffer of InterIntra is from inter prediction.
   // The second buffer is from intra prediction.
-  Array2D<uint16_t> intra_prediction;
   ptrdiff_t intra_stride;
   const int bitdepth = sequence_header_.color_config.bitdepth;
   if (bitdepth == 8) {
@@ -625,88 +595,122 @@ void Tile::InterIntraPrediction(
     // 8, |buffer_| is uint8_t and hence a copy has to be made. For higher
     // bitdepths, the |buffer_| itself can act as an uint16_t buffer so no
     // copy is necessary.
-    if (!intra_prediction.Reset(prediction_height, prediction_width)) {
-      LIBGAV1_DLOG(ERROR,
-                   "Can't allocate memory for the intra prediction block.");
-      return;
-    }
     uint8_t* dest_ptr = dest;
+    Array2DView<uint16_t> intra_prediction(
+        kMaxSuperBlockSizeInPixels, kMaxSuperBlockSizeInPixels, prediction[1]);
     for (int r = 0; r < prediction_height; ++r) {
       for (int c = 0; c < prediction_width; ++c) {
         intra_prediction[r][c] = dest_ptr[c];
       }
       dest_ptr += dest_stride;
     }
-    prediction[1] = intra_prediction.data();
-    intra_stride = prediction_width;
+    intra_stride = kMaxSuperBlockSizeInPixels;
   } else {
     prediction[1] = reinterpret_cast<uint16_t*>(dest);
     intra_stride = dest_stride / sizeof(uint16_t);
   }
-  dsp_.mask_blend(prediction[0], prediction_stride, prediction[1], intra_stride,
-                  prediction_mask, prediction_mask_stride, prediction_width,
-                  prediction_height, subsampling_x, subsampling_y,
-                  prediction_parameters.inter_intra_mode != kNumInterIntraModes,
-                  prediction_parameters.is_wedge_inter_intra, post_round_bits,
-                  dest, dest_stride);
+  GetMaskBlendFunc(dsp_, prediction_parameters.inter_intra_mode,
+                   prediction_parameters.is_wedge_inter_intra, subsampling_x,
+                   subsampling_y)(prediction[0], prediction_stride,
+                                  prediction[1], intra_stride, prediction_mask,
+                                  prediction_mask_stride, prediction_width,
+                                  prediction_height, dest, dest_stride);
 }
 
 void Tile::CompoundInterPrediction(
-    const Block& block, uint16_t* prediction[2],
-    const ptrdiff_t prediction_stride, const ptrdiff_t prediction_mask_stride,
-    const int prediction_width, const int prediction_height, const Plane plane,
-    const int subsampling_x, const int subsampling_y, const int bitdepth,
-    const int candidate_row, const int candidate_column, uint8_t* dest,
-    const ptrdiff_t dest_stride, const uint8_t post_round_bits) {
+    const Block& block, const ptrdiff_t prediction_stride,
+    const ptrdiff_t prediction_mask_stride, const int prediction_width,
+    const int prediction_height, const Plane plane, const int subsampling_x,
+    const int subsampling_y, const int bitdepth, const int candidate_row,
+    const int candidate_column, uint8_t* dest, const ptrdiff_t dest_stride) {
   const PredictionParameters& prediction_parameters =
       *block.bp->prediction_parameters;
+  uint16_t* prediction[2] = {block.scratch_buffer->prediction_buffer[0],
+                             block.scratch_buffer->prediction_buffer[1]};
   switch (prediction_parameters.compound_prediction_type) {
     case kCompoundPredictionTypeWedge:
-      dsp_.mask_blend(
+      GetMaskBlendFunc(dsp_, prediction_parameters.inter_intra_mode,
+                       prediction_parameters.is_wedge_inter_intra,
+                       subsampling_x, subsampling_y)(
           prediction[0], prediction_stride, prediction[1], prediction_stride,
-          block.sb_buffer->prediction_mask, prediction_mask_stride,
-          prediction_width, prediction_height, subsampling_x, subsampling_y,
-          prediction_parameters.inter_intra_mode != kNumInterIntraModes,
-          prediction_parameters.is_wedge_inter_intra, post_round_bits, dest,
-          dest_stride);
+          block.scratch_buffer->prediction_mask, prediction_mask_stride,
+          prediction_width, prediction_height, dest, dest_stride);
       break;
     case kCompoundPredictionTypeDiffWeighted:
       if (plane == kPlaneY) {
         GenerateWeightMask(
             prediction[0], prediction_stride, prediction[1], prediction_stride,
-            prediction_parameters.mask_is_inverse, post_round_bits,
-            prediction_width, prediction_height, bitdepth,
-            block.sb_buffer->prediction_mask, prediction_mask_stride);
+            prediction_parameters.mask_is_inverse, prediction_width,
+            prediction_height, bitdepth, block.scratch_buffer->prediction_mask,
+            prediction_mask_stride);
       }
-      dsp_.mask_blend(
+      GetMaskBlendFunc(dsp_, prediction_parameters.inter_intra_mode,
+                       prediction_parameters.is_wedge_inter_intra,
+                       subsampling_x, subsampling_y)(
           prediction[0], prediction_stride, prediction[1], prediction_stride,
-          block.sb_buffer->prediction_mask, prediction_mask_stride,
-          prediction_width, prediction_height, subsampling_x, subsampling_y,
-          prediction_parameters.inter_intra_mode != kNumInterIntraModes,
-          prediction_parameters.is_wedge_inter_intra, post_round_bits, dest,
-          dest_stride);
+          block.scratch_buffer->prediction_mask, prediction_mask_stride,
+          prediction_width, prediction_height, dest, dest_stride);
       break;
     case kCompoundPredictionTypeDistance:
       DistanceWeightedPrediction(
           prediction[0], prediction_stride, prediction[1], prediction_stride,
           prediction_width, prediction_height, candidate_row, candidate_column,
-          dest, dest_stride, post_round_bits);
-      break;
-    case kCompoundPredictionTypeAverage:
-      dsp_.average_blend(prediction[0], prediction_stride, prediction[1],
-                         prediction_stride, post_round_bits, prediction_width,
-                         prediction_height, dest, dest_stride);
+          dest, dest_stride);
       break;
     default:
-      assert(false && "This is not a compound type.\n");
-      return;
+      assert(prediction_parameters.compound_prediction_type ==
+             kCompoundPredictionTypeAverage);
+      dsp_.average_blend(prediction[0], prediction_stride, prediction[1],
+                         prediction_stride, prediction_width, prediction_height,
+                         dest, dest_stride);
+      break;
   }
 }
 
-bool Tile::InterPrediction(const Block& block, Plane plane, int x, int y,
-                           int prediction_width, int prediction_height,
-                           int candidate_row, int candidate_column,
-                           bool* const is_local_valid,
+GlobalMotion* Tile::GetWarpParams(
+    const Block& block, const Plane plane, const int prediction_width,
+    const int prediction_height,
+    const PredictionParameters& prediction_parameters,
+    const ReferenceFrameType reference_type, bool* const is_local_valid,
+    GlobalMotion* const global_motion_params,
+    GlobalMotion* const local_warp_params) const {
+  if (prediction_width < 8 || prediction_height < 8 ||
+      frame_header_.force_integer_mv == 1) {
+    return nullptr;
+  }
+  if (plane == kPlaneY) {
+    *is_local_valid =
+        prediction_parameters.motion_mode == kMotionModeLocalWarp &&
+        WarpEstimation(
+            prediction_parameters.num_warp_samples, DivideBy4(prediction_width),
+            DivideBy4(prediction_height), block.row4x4, block.column4x4,
+            block.bp->mv[0], prediction_parameters.warp_estimate_candidates,
+            local_warp_params) &&
+        SetupShear(local_warp_params);
+  }
+  if (prediction_parameters.motion_mode == kMotionModeLocalWarp &&
+      *is_local_valid) {
+    return local_warp_params;
+  }
+  if (!IsScaled(reference_type)) {
+    GlobalMotionTransformationType global_motion_type =
+        (reference_type != kReferenceFrameIntra)
+            ? global_motion_params->type
+            : kNumGlobalMotionTransformationTypes;
+    const bool is_global_valid =
+        IsGlobalMvBlock(block.bp->y_mode, global_motion_type, block.size) &&
+        SetupShear(global_motion_params);
+    // Valid global motion type implies reference type can't be intra.
+    assert(!is_global_valid || reference_type != kReferenceFrameIntra);
+    if (is_global_valid) return global_motion_params;
+  }
+  return nullptr;
+}
+
+void Tile::InterPrediction(const Block& block, const Plane plane, const int x,
+                           const int y, const int prediction_width,
+                           const int prediction_height, int candidate_row,
+                           int candidate_column, bool* const is_local_valid,
                            GlobalMotion* const local_warp_params) {
   const int bitdepth = sequence_header_.color_config.bitdepth;
   const BlockParameters& bp = *block.bp;
@@ -716,92 +720,45 @@ bool Tile::InterPrediction(const Block& block, Plane plane, int x, int y,
       bp_reference.reference_frame[1] > kReferenceFrameIntra;
   const bool is_inter_intra =
       bp.is_inter && bp.reference_frame[1] == kReferenceFrameIntra;
-  const ptrdiff_t prediction_stride = kMaxSuperBlockSizeInPixels;
-  AlignedUniquePtr<uint16_t> prediction[2] = {
-      MakeAlignedUniquePtr<uint16_t>(
-          8, kMaxSuperBlockSizeInPixels * prediction_stride),
-      AlignedUniquePtr<uint16_t>()};
-  if (prediction[0] == nullptr) {
-    LIBGAV1_DLOG(ERROR,
-                 "Can't allocate memory for the first prediction block.");
-    return false;
-  }
-  if (is_compound) {
-    prediction[1] = MakeAlignedUniquePtr<uint16_t>(
-        8, kMaxSuperBlockSizeInPixels * prediction_stride);
-    if (prediction[1] == nullptr) {
-      LIBGAV1_DLOG(ERROR,
-                   "Can't allocate memory for the second prediction block.");
-      return false;
-    }
-  }
-  uint8_t* const dest = GetStartPoint(buffer_, plane, x, y, bitdepth);
-  const ptrdiff_t dest_stride = buffer_[plane].columns();  // In bytes.
-  uint8_t round_bits[2];
-  uint8_t post_round_bits;
-  SetInterRoundingBits(is_compound, sequence_header_.color_config.bitdepth,
-                       round_bits, &post_round_bits);
+  const ptrdiff_t prediction_stride = prediction_width;
+
   const PredictionParameters& prediction_parameters =
       *block.bp->prediction_parameters;
-  if (plane == kPlaneY) {
-    *is_local_valid =
-        prediction_parameters.motion_mode == kMotionModeLocalWarp &&
-        WarpEstimation(
-            prediction_parameters.num_warp_samples, DivideBy4(prediction_width),
-            DivideBy4(prediction_height), block.row4x4, block.column4x4,
-            bp.mv[0], prediction_parameters.warp_estimate_candidates,
-            local_warp_params) &&
-        SetupShear(local_warp_params);
-  }
-
+  uint8_t* const dest = GetStartPoint(buffer_, plane, x, y, bitdepth);
+  const ptrdiff_t dest_stride = buffer_[plane].columns();  // In bytes.
+  const int round_bits =
+      GetInterRoundingBits(is_compound, sequence_header_.color_config.bitdepth);
   for (int index = 0; index < 1 + static_cast<int>(is_compound); ++index) {
     const ReferenceFrameType reference_type =
         bp_reference.reference_frame[index];
     GlobalMotion global_motion_params =
         frame_header_.global_motion[reference_type];
-    GlobalMotionTransformationType global_motion_type =
-        (reference_type != kReferenceFrameIntra)
-            ? global_motion_params.type
-            : kNumGlobalMotionTransformationTypes;
-    const bool is_global_valid =
-        IsGlobalMvBlock(bp.y_mode, global_motion_type, block.size) &&
-        SetupShear(&global_motion_params);
-    // Valid global motion type implies reference type can't be intra.
-    assert(!is_global_valid || reference_type != kReferenceFrameIntra);
-    GlobalMotion* warp_params = nullptr;
-    if (prediction_width < 8 || prediction_height < 8 ||
-        frame_header_.force_integer_mv == 1) {
-      warp_params = nullptr;
-    } else if (prediction_parameters.motion_mode == kMotionModeLocalWarp &&
-               *is_local_valid) {
-      warp_params = local_warp_params;
-    } else if (is_global_valid && !IsScaled(reference_type)) {
-      warp_params = &global_motion_params;
-    }
+    GlobalMotion* warp_params =
+        GetWarpParams(block, plane, prediction_width, prediction_height,
+                      prediction_parameters, reference_type, is_local_valid,
+                      &global_motion_params, local_warp_params);
     if (warp_params != nullptr) {
-      if (!BlockWarpProcess(block, plane, index, prediction_width,
-                            prediction_height, prediction[index].get(),
-                            prediction_stride, warp_params, round_bits,
-                            is_compound, is_inter_intra, dest, dest_stride)) {
-        return false;
-      }
+      BlockWarpProcess(block, plane, index, x, y, prediction_width,
+                       prediction_height, prediction_stride, warp_params,
+                       round_bits, is_compound, is_inter_intra, dest,
+                       dest_stride);
     } else {
       const int reference_index =
           prediction_parameters.use_intra_block_copy
               ? -1
               : frame_header_.reference_frame_index[reference_type -
                                                     kReferenceFrameLast];
-      BlockInterPrediction(plane, reference_index, bp_reference.mv[index], x, y,
-                           prediction_width, prediction_height, candidate_row,
-                           candidate_column, prediction[index].get(),
-                           prediction_stride, round_bits, is_compound,
-                           is_inter_intra, dest, dest_stride);
+      BlockInterPrediction(
+          block, plane, reference_index, bp_reference.mv[index], x, y,
+          prediction_width, prediction_height, candidate_row, candidate_column,
+          block.scratch_buffer->prediction_buffer[index], prediction_stride,
+          round_bits, is_compound, is_inter_intra, dest, dest_stride);
     }
   }
 
   const ptrdiff_t prediction_mask_stride = kMaxSuperBlockSizeInPixels;
-  const int subsampling_x = SubsamplingX(plane);
-  const int subsampling_y = SubsamplingY(plane);
+  const int subsampling_x = subsampling_x_[plane];
+  const int subsampling_y = subsampling_y_[plane];
   if (prediction_parameters.compound_prediction_type ==
           kCompoundPredictionTypeWedge &&
       plane == kPlaneY) {
@@ -815,29 +772,23 @@ bool Tile::InterPrediction(const Block& block, Plane plane, int x, int y,
     const int offset = block_size_index * wedge_mask_stride_3 +
                        prediction_parameters.wedge_sign * wedge_mask_stride_2 +
                        prediction_parameters.wedge_index * wedge_mask_stride_1;
-    const int stride = kWedgeMaskMasterSize;
-    uint8_t* mask_ptr = block.sb_buffer->prediction_mask;
-    const uint8_t* wedge_mask_ptr = &wedge_masks_[offset];
-    for (int y = 0; y < prediction_height; ++y) {
-      memcpy(mask_ptr, wedge_mask_ptr, prediction_width);
-      mask_ptr += kMaxSuperBlockSizeInPixels;
-      wedge_mask_ptr += stride;
-    }
+    PopulatePredictionMaskFromWedgeMask(
+        &wedge_masks_[offset], kWedgeMaskMasterSize, prediction_width,
+        prediction_height, block.scratch_buffer->prediction_mask,
+        kMaxSuperBlockSizeInPixels);
   } else if (prediction_parameters.compound_prediction_type ==
              kCompoundPredictionTypeIntra) {
     GenerateInterIntraMask(prediction_parameters.inter_intra_mode,
                            prediction_width, prediction_height,
-                           block.sb_buffer->prediction_mask,
+                           block.scratch_buffer->prediction_mask,
                            prediction_mask_stride);
   }
 
-  uint16_t* prediction_ptr[2] = {prediction[0].get(), prediction[1].get()};
   if (is_compound) {
-    CompoundInterPrediction(
-        block, prediction_ptr, prediction_stride, prediction_mask_stride,
-        prediction_width, prediction_height, plane, subsampling_x,
-        subsampling_y, bitdepth, candidate_row, candidate_column, dest,
-        dest_stride, post_round_bits);
+    CompoundInterPrediction(block, prediction_stride, prediction_mask_stride,
+                            prediction_width, prediction_height, plane,
+                            subsampling_x, subsampling_y, bitdepth,
+                            candidate_row, candidate_column, dest, dest_stride);
   } else {
     if (prediction_parameters.motion_mode == kMotionModeObmc) {
       // Obmc mode is allowed only for single reference (!is_compound).
@@ -845,67 +796,65 @@ bool Tile::InterPrediction(const Block& block, Plane plane, int x, int y,
                      round_bits);
     } else if (is_inter_intra) {
       // InterIntra and obmc must be mutually exclusive.
+      uint16_t* prediction_ptr[2] = {
+          block.scratch_buffer->prediction_buffer[0],
+          block.scratch_buffer->prediction_buffer[1]};
       InterIntraPrediction(prediction_ptr, prediction_stride,
-                           block.sb_buffer->prediction_mask,
+                           block.scratch_buffer->prediction_mask,
                            prediction_mask_stride, prediction_parameters,
                            prediction_width, prediction_height, subsampling_x,
-                           subsampling_y, post_round_bits, dest, dest_stride);
+                           subsampling_y, dest, dest_stride);
     }
   }
-  return true;
 }
 
-void Tile::ObmcBlockPrediction(const MotionVector& mv, const Plane plane,
+void Tile::ObmcBlockPrediction(const Block& block, const MotionVector& mv,
+                               const Plane plane,
                                const int reference_frame_index, const int width,
                                const int height, const int x, const int y,
                                const int candidate_row,
                                const int candidate_column,
-                               const uint8_t* const mask,
-                               const int blending_direction,
-                               const uint8_t* const round_bits) {
-  uint16_t
-      obmc_prediction[kMaxSuperBlockSizeInPixels *
-                      (kMaxSuperBlockSizeInPixels + 2 * kRestorationBorder)];
-  const int obmc_prediction_stride = width + 2 * kRestorationBorder;
+                               const ObmcDirection blending_direction,
+                               const int round_bits) {
   const int bitdepth = sequence_header_.color_config.bitdepth;
   // Obmc's prediction needs to be clipped before blending with above/left
   // prediction blocks.
-  uint8_t obmc_clipped_prediction[2 * kMaxSuperBlockSizeInPixels *
-                                  (kMaxSuperBlockSizeInPixels +
-                                   2 * kRestorationBorder)];
+  uint8_t obmc_clipped_prediction[kObmcBufferSize
+#if LIBGAV1_MAX_BITDEPTH >= 10
+                                  * 2
+#endif
+  ];
   const ptrdiff_t obmc_clipped_prediction_stride =
-      (bitdepth == 8) ? obmc_prediction_stride
-                      : obmc_prediction_stride * sizeof(uint16_t);
-  BlockInterPrediction(plane, reference_frame_index, mv, x, y, width, height,
-                       candidate_row, candidate_column, obmc_prediction,
-                       obmc_prediction_stride, round_bits, false, false,
-                       obmc_clipped_prediction, obmc_clipped_prediction_stride);
+      (bitdepth == 8) ? width : width * sizeof(uint16_t);
+  BlockInterPrediction(block, plane, reference_frame_index, mv, x, y, width,
+                       height, candidate_row, candidate_column, nullptr, width,
+                       round_bits, false, false, obmc_clipped_prediction,
+                       obmc_clipped_prediction_stride);
 
   uint8_t* const prediction = GetStartPoint(buffer_, plane, x, y, bitdepth);
   const ptrdiff_t prediction_stride = buffer_[plane].columns();
-  dsp_.obmc_blend(prediction, prediction_stride, width, height,
-                  blending_direction, mask, obmc_clipped_prediction,
-                  obmc_clipped_prediction_stride);
+  dsp_.obmc_blend[blending_direction](prediction, prediction_stride, width,
+                                      height, obmc_clipped_prediction,
+                                      obmc_clipped_prediction_stride);
 }
 
 void Tile::ObmcPrediction(const Block& block, const Plane plane,
                           const int width, const int height,
-                          const uint8_t* const round_bits) {
-  const int subsampling_x = SubsamplingX(plane);
-  const int subsampling_y = SubsamplingY(plane);
-  const BlockSize plane_block_size =
-      kPlaneResidualSize[block.size][SubsamplingX(plane)][SubsamplingY(plane)];
-  assert(plane_block_size != kBlockInvalid);
+                          const int round_bits) {
+  const int subsampling_x = subsampling_x_[plane];
+  const int subsampling_y = subsampling_y_[plane];
   const int num4x4_wide = kNum4x4BlocksWide[block.size];
   const int num4x4_high = kNum4x4BlocksHigh[block.size];
 
-  if (block.top_available && !IsBlockSmallerThan8x8(plane_block_size)) {
+  if (block.top_available &&
+      !IsBlockSmallerThan8x8(block.residual_size[GetPlaneType(plane)])) {
     const int num_limit = std::min(uint8_t{4}, k4x4WidthLog2[block.size]);
     const int column4x4_max =
         std::min(block.column4x4 + num4x4_wide, frame_header_.columns4x4);
     const int candidate_row = block.row4x4 - 1;
     const int block_start_y = MultiplyBy4(block.row4x4) >> subsampling_y;
     int column4x4 = block.column4x4;
+    const int prediction_height = std::min(height >> 1, 32 >> subsampling_y);
     for (int i = 0, step; i < num_limit && column4x4 < column4x4_max;
          column4x4 += step) {
       const int candidate_column = column4x4 | 1;
@@ -920,14 +869,12 @@ void Tile::ObmcPrediction(const Block& block, const Plane plane,
                                                 kReferenceFrameLast];
         const int prediction_width =
             std::min(width, MultiplyBy4(step) >> subsampling_x);
-        const int prediction_height =
-            std::min(height >> 1, 32 >> subsampling_y);
-        const uint8_t* mask = GetObmcMask(prediction_height);
-        ObmcBlockPrediction(
-            bp_top.mv[0], plane, candidate_reference_frame_index,
-            prediction_width, prediction_height,
-            MultiplyBy4(column4x4) >> subsampling_x, block_start_y,
-            candidate_row, candidate_column, mask, kBlendFromAbove, round_bits);
+        ObmcBlockPrediction(block, bp_top.mv[0], plane,
+                            candidate_reference_frame_index, prediction_width,
+                            prediction_height,
+                            MultiplyBy4(column4x4) >> subsampling_x,
+                            block_start_y, candidate_row, candidate_column,
+                            kObmcDirectionVertical, round_bits);
       }
     }
   }
@@ -939,6 +886,7 @@ void Tile::ObmcPrediction(const Block& block, const Plane plane,
     const int candidate_column = block.column4x4 - 1;
     int row4x4 = block.row4x4;
     const int block_start_x = MultiplyBy4(block.column4x4) >> subsampling_x;
+    const int prediction_width = std::min(width >> 1, 32 >> subsampling_x);
     for (int i = 0, step; i < num_limit && row4x4 < row4x4_max;
          row4x4 += step) {
       const int candidate_row = row4x4 | 1;
@@ -951,15 +899,13 @@ void Tile::ObmcPrediction(const Block& block, const Plane plane,
         const int candidate_reference_frame_index =
             frame_header_.reference_frame_index[bp_left.reference_frame[0] -
                                                 kReferenceFrameLast];
-        const int prediction_width = std::min(width >> 1, 32 >> subsampling_x);
         const int prediction_height =
             std::min(height, MultiplyBy4(step) >> subsampling_y);
-        const uint8_t* mask = GetObmcMask(prediction_width);
-        ObmcBlockPrediction(bp_left.mv[0], plane,
-                            candidate_reference_frame_index, prediction_width,
-                            prediction_height, block_start_x,
-                            MultiplyBy4(row4x4) >> subsampling_y, candidate_row,
-                            candidate_column, mask, kBlendFromLeft, round_bits);
+        ObmcBlockPrediction(
+            block, bp_left.mv[0], plane, candidate_reference_frame_index,
+            prediction_width, prediction_height, block_start_x,
+            MultiplyBy4(row4x4) >> subsampling_y, candidate_row,
+            candidate_column, kObmcDirectionHorizontal, round_bits);
       }
     }
   }
@@ -969,7 +915,7 @@ void Tile::DistanceWeightedPrediction(
     uint16_t* prediction_0, ptrdiff_t prediction_stride_0,
     uint16_t* prediction_1, ptrdiff_t prediction_stride_1, const int width,
     const int height, const int candidate_row, const int candidate_column,
-    uint8_t* dest, ptrdiff_t dest_stride, const uint8_t post_round_bits) {
+    uint8_t* dest, ptrdiff_t dest_stride) {
   int distance[2];
   int weight[2];
   for (int reference = 0; reference < 2; ++reference) {
@@ -987,9 +933,9 @@ void Tile::DistanceWeightedPrediction(
   }
   GetDistanceWeights(distance, weight);
 
-  dsp_.distance_weighted_blend(
-      prediction_0, prediction_stride_0, prediction_1, prediction_stride_1,
-      weight[0], weight[1], post_round_bits, width, height, dest, dest_stride);
+  dsp_.distance_weighted_blend(prediction_0, prediction_stride_0, prediction_1,
+                               prediction_stride_1, weight[0], weight[1], width,
+                               height, dest, dest_stride);
 }
 
 bool Tile::GetReferenceBlockPosition(
@@ -1011,12 +957,11 @@ bool Tile::GetReferenceBlockPosition(
   *ref_block_end_y =
       GetPixelPositionFromHighScale(start_y, step_y, height - 1) +
       kConvolveBorderRightBottom;
-  int block_height =
-      height + kConvolveBorderLeftTop + kConvolveBorderRightBottom;
   if (is_scaled) {
-    block_height = (((height - 1) * step_y + (1 << kScaleSubPixelBits) - 1) >>
-                    kScaleSubPixelBits) +
-                   kSubPixelTaps;
+    const int block_height =
+        (((height - 1) * step_y + (1 << kScaleSubPixelBits) - 1) >>
+         kScaleSubPixelBits) +
+        kSubPixelTaps;
     *ref_block_end_y = *ref_block_start_y + block_height - 1;
   }
   const bool extend_left = *ref_block_start_x < ref_start_x;
@@ -1101,13 +1046,12 @@ void Tile::BuildConvolveBlock(const Plane plane,
 }
 
 void Tile::BlockInterPrediction(
-    const Plane plane, const int reference_frame_index, const MotionVector& mv,
-    const int x, const int y, const int width, const int height,
-    const int candidate_row, const int candidate_column,
+    const Block& block, const Plane plane, const int reference_frame_index,
+    const MotionVector& mv, const int x, const int y, const int width,
+    const int height, const int candidate_row, const int candidate_column,
     uint16_t* const prediction, const ptrdiff_t prediction_stride,
-    const uint8_t* const round_bits, const bool is_compound,
-    const bool is_inter_intra, uint8_t* const dest,
-    const ptrdiff_t dest_stride) {
+    const int round_bits, const bool is_compound, const bool is_inter_intra,
+    uint8_t* const dest, const ptrdiff_t dest_stride) {
   const BlockParameters& bp =
       *block_parameters_holder_.Find(candidate_row, candidate_column);
   int start_x;
@@ -1116,12 +1060,12 @@ void Tile::BlockInterPrediction(
   int step_y;
   ScaleMotionVector(mv, plane, reference_frame_index, x, y, &start_x, &start_y,
                     &step_x, &step_y);
-  // reference_frame_index equal to -1 indicates using current frame as
-  // reference.
   const int horizontal_filter_index = bp.interpolation_filter[1];
   const int vertical_filter_index = bp.interpolation_filter[0];
-  const int subsampling_x = SubsamplingX(plane);
-  const int subsampling_y = SubsamplingY(plane);
+  const int subsampling_x = subsampling_x_[plane];
+  const int subsampling_y = subsampling_y_[plane];
+  // reference_frame_index equal to -1 indicates using current frame as
+  // reference.
   const YuvBuffer* const reference_buffer =
       (reference_frame_index == -1)
           ? current_frame_.buffer()
@@ -1157,7 +1101,6 @@ void Tile::BlockInterPrediction(
       reference_buffer->right_border(plane),
       reference_buffer->bottom_border(plane), &ref_block_start_x,
       &ref_block_start_y, &ref_block_end_x, &ref_block_end_y);
-  AlignedUniquePtr<uint8_t> block_buffer;
   const uint8_t* block_start = nullptr;
   ptrdiff_t block_stride;
   if (!extend_block) {
@@ -1182,34 +1125,22 @@ void Tile::BlockInterPrediction(
     block_stride =
         (2 * width + kConvolveBorderLeftTop + kConvolveBorderRightBottom) *
         pixel_size;
-    const int alignment = 16;
-    int block_height =
-        height + kConvolveBorderLeftTop + kConvolveBorderRightBottom;
-    if (is_scaled) {
-      block_height = (((height - 1) * step_y + (1 << kScaleSubPixelBits) - 1) >>
-                      kScaleSubPixelBits) +
-                     kSubPixelTaps;
-    }
-    block_buffer =
-        MakeAlignedUniquePtr<uint8_t>(alignment, block_stride * block_height);
-    if (block_buffer == nullptr) {
-      LIBGAV1_DLOG(ERROR, "Can't allocate memory for the reference block.");
-      return;
-    }
     if (bitdepth == 8) {
       BuildConvolveBlock<uint8_t>(
           plane, reference_frame_index, is_scaled, height, ref_start_x,
           ref_last_x, ref_start_y, ref_last_y, step_y, ref_block_start_x,
-          ref_block_end_x, ref_block_start_y, block_buffer.get(), block_stride);
+          ref_block_end_x, ref_block_start_y,
+          block.scratch_buffer->convolve_block_buffer, block_stride);
 #if LIBGAV1_MAX_BITDEPTH >= 10
     } else {
       BuildConvolveBlock<uint16_t>(
           plane, reference_frame_index, is_scaled, height, ref_start_x,
           ref_last_x, ref_start_y, ref_last_y, step_y, ref_block_start_x,
-          ref_block_end_x, ref_block_start_y, block_buffer.get(), block_stride);
+          ref_block_end_x, ref_block_start_y,
+          block.scratch_buffer->convolve_block_buffer, block_stride);
 #endif
     }
-    block_start = block_buffer.get() +
+    block_start = block.scratch_buffer->convolve_block_buffer +
                   (is_scaled ? 0
                              : kConvolveBorderLeftTop * block_stride +
                                    kConvolveBorderLeftTop * pixel_size);
@@ -1223,6 +1154,7 @@ void Tile::BlockInterPrediction(
       (is_compound || is_inter_intra) ? prediction : static_cast<void*>(dest);
   const ptrdiff_t output_stride =
       (is_compound || is_inter_intra) ? prediction_stride : dest_stride;
+  assert(output != nullptr);
   dsp::ConvolveFunc convolve_func =
       is_scaled ? dsp_.convolve_scale[is_compound || is_inter_intra]
                 : dsp_.convolve[reference_frame_index == -1][is_compound]
@@ -1237,13 +1169,15 @@ void Tile::BlockInterPrediction(
                 step_y, width, height, output, output_stride);
 }
 
-bool Tile::BlockWarpProcess(const Block& block, const Plane plane,
-                            const int index, const int width, const int height,
-                            uint16_t* prediction, ptrdiff_t prediction_stride,
-                            GlobalMotion* warp_params,
-                            const uint8_t* const round_bits,
-                            const bool is_compound, const bool is_inter_intra,
-                            uint8_t* const dest, const ptrdiff_t dest_stride) {
+void Tile::BlockWarpProcess(const Block& block, const Plane plane,
+                            const int index, const int block_start_x,
+                            const int block_start_y, const int width,
+                            const int height, const ptrdiff_t prediction_stride,
+                            GlobalMotion* const warp_params,
+                            const int round_bits, const bool is_compound,
+                            const bool is_inter_intra, uint8_t* const dest,
+                            const ptrdiff_t dest_stride) {
+  assert(width >= 8 && height >= 8);
   const BlockParameters& bp = *block.bp;
   const int reference_frame_index =
       frame_header_.reference_frame_index[bp.reference_frame[index] -
@@ -1258,15 +1192,9 @@ bool Tile::BlockWarpProcess(const Block& block, const Plane plane,
   const int source_height =
       reference_frames_[reference_frame_index]->buffer()->displayed_height(
           plane);
-  const int block_start_x = MultiplyBy4(block.column4x4) >> SubsamplingX(plane);
-  const int block_start_y = MultiplyBy4(block.row4x4) >> SubsamplingY(plane);
-  const bool warp_valid = SetupShear(warp_params);
-  if (!warp_valid) {
-    LIBGAV1_DLOG(ERROR, "Invalid warp parameters.");
-    return false;
-  }
+  uint16_t* const prediction = block.scratch_buffer->prediction_buffer[index];
   dsp_.warp(source, source_stride, source_width, source_height,
-            warp_params->params, SubsamplingX(plane), SubsamplingY(plane),
+            warp_params->params, subsampling_x_[plane], subsampling_y_[plane],
             round_bits, block_start_x, block_start_y, width, height,
             warp_params->alpha, warp_params->beta, warp_params->gamma,
             warp_params->delta, prediction, prediction_stride);
@@ -1282,7 +1210,6 @@ bool Tile::BlockWarpProcess(const Block& block, const Plane plane,
 #endif
     }
   }
-  return true;
 }
 
 }  // namespace libgav1
